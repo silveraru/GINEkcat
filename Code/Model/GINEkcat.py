@@ -1,51 +1,108 @@
 import torch
-import torch.nn as nn
-from transformers import ChemBERTaTokenizer, ChemBERTaModel
-from torch_geometric.nn import GINEConv
-from esm import ProteinBertModel
+from torch import nn
+from Code.Model.GINE import GINE
+from Code.Model.ChemBERTa import ChemBERTaEncoder
+from Code.Model.ESM import ESMEncoder
+import torch.nn.functional as F
+
 
 class GINEkcat(nn.Module):
-    def __init__(self):
+    def __init__(self, dim=64, layer_output=3, dropout=0.3, 
+                 gine_layers=3, edge_dim=10):
         super(GINEkcat, self).__init__()
-
-        # ChemBERTa Encoder for SMILES
-        self.chemberta_tokenizer = ChemBERTaTokenizer.from_pretrained('seyonec/ChemBERTa-ZINC-250k')
-        self.chemberta_model = ChemBERTaModel.from_pretrained('seyonec/ChemBERTa-ZINC-250k')
-
-        # GINE Encoder for substrate graph
-        self.gine_encoder = GINEConv(nn.Linear(128, 128))
-
-        # ESM Encoder for protein sequences
-        self.esm_model = ProteinBertModel.from_pretrained("facebookresearch/esm")
         
-        # GINE Encoder for PDB structure
-        self.gine_pdb_encoder = GINEConv(nn.Linear(128, 128))
-
-        # Fusion Layers
-        self.fusion_layer = nn.Linear(128 * 3, 128)  # Adjusted for combined inputs
+        # Substrate encoder: ChemBERTa
+        self.chemberta = ChemBERTaEncoder(output_dim=dim)
         
-        # Output Layer for kcat prediction
-        self.output_layer = nn.Linear(128, 1)
+        # Substrate graph encoder: GINE
+        self.substrate_gine = GINE(
+            in_features=dim, 
+            hidden_features=dim, 
+            out_features=dim,
+            edge_dim=edge_dim,
+            num_layers=gine_layers,
+            dropout=dropout
+        )
+        
+        # Protein sequence encoder: ESM
+        self.esm = ESMEncoder(output_dim=dim)
+        
+        # Protein structure encoder: GINE
+        self.structure_gine = GINE(
+            in_features=dim,
+            hidden_features=dim,
+            out_features=dim,
+            edge_dim=edge_dim,
+            num_layers=gine_layers,
+            dropout=dropout
+        )
+        
+        # Output layers
+        self.W_out = nn.ModuleList([nn.Linear(4 * dim, 4 * dim) for _ in range(layer_output)])
+        self.W_interaction = nn.Linear(4 * dim, 1)
+        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, smiles, substrate_graph, protein_seq, pdb_structure):
-        # ChemBERTa encoding
-        chemberta_input = self.chemberta_tokenizer(smiles, return_tensors='pt')
-        chemberta_output = self.chemberta_model(**chemberta_input).last_hidden_state
-
-        # GINE encoding for substrate graph
-        substrate_encoding = self.gine_encoder(substrate_graph)
-
-        # ESM encoding for protein sequence
-        esm_output = self.esm_model(protein_seq)
-
-        # GINE encoding for PDB structure
-        pdb_encoding = self.gine_pdb_encoder(pdb_structure)
-
-        # Combine all encodings
-        combined = torch.cat((chemberta_output, substrate_encoding, esm_output, pdb_encoding), dim=-1)
-        fused_output = self.fusion_layer(combined)
-
-        # Output for kcat prediction
-        kcat_prediction = self.output_layer(fused_output)
-
-        return kcat_prediction
+    def forward(self, inputs, layer_output, dropout):
+        smiles, substrate_graph, protein_seq, structure_graph = inputs[:4]
+        
+        # 1. ChemBERTa encoding for substrate
+        chemberta_vectors = self.chemberta(smiles)
+        if chemberta_vectors.dim() > 1:
+            chemberta_vectors = torch.mean(chemberta_vectors, 0, keepdim=True)
+        else:
+            chemberta_vectors = chemberta_vectors.unsqueeze(0)
+        
+        # 2. GINE encoding for substrate graph
+        substrate_vectors = self.substrate_gine(
+            substrate_graph['x'],
+            substrate_graph['edge_index'],
+            substrate_graph['edge_attr'],
+            substrate_graph.get('batch', None)
+        )
+        if substrate_vectors.dim() > 1:
+            substrate_vectors = torch.mean(substrate_vectors, 0, keepdim=True)
+        else:
+            substrate_vectors = substrate_vectors.unsqueeze(0)
+        
+        # 3. ESM encoding for protein sequence
+        esm_vectors = self.esm(protein_seq)
+        if esm_vectors.dim() > 1:
+            esm_vectors = torch.mean(esm_vectors, 0, keepdim=True)
+        else:
+            esm_vectors = esm_vectors.unsqueeze(0)
+        
+        # 4. GINE encoding for protein structure (PDB)
+        structure_vectors = self.structure_gine(
+            structure_graph['x'],
+            structure_graph['edge_index'],
+            structure_graph['edge_attr'],
+            structure_graph.get('batch', None)
+        )
+        if structure_vectors.dim() > 1:
+            structure_vectors = torch.mean(structure_vectors, 0, keepdim=True)
+        else:
+            structure_vectors = structure_vectors.unsqueeze(0)
+        
+        # 5. Concatenate all representations
+        cat_vector = torch.cat((chemberta_vectors, substrate_vectors, esm_vectors, structure_vectors), 1)
+        
+        # 6. Output layers
+        for j in range(layer_output):
+            cat_vector = F.relu(cat_vector)
+            cat_vector = F.dropout(cat_vector, dropout, training=self.training)
+            cat_vector = self.W_out[j](cat_vector)
+        
+        cat_vector = F.relu(cat_vector)
+        cat_vector = F.dropout(cat_vector, dropout, training=self.training)
+        interaction = self.W_interaction(cat_vector)
+        interaction = torch.squeeze(interaction, 0)
+        
+        return interaction
+    
+    def freeze_pretrained(self):
+        self.chemberta.freeze_chemberta()
+        self.esm.freeze_esm()
+    
+    def unfreeze_pretrained(self):
+        self.chemberta.unfreeze_chemberta()
+        self.esm.unfreeze_esm()
